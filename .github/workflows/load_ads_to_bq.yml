@@ -31,8 +31,9 @@ jobs:
 
       - name: Run pipeline
         env:
+          PYTHONUNBUFFERED: "1"   # <--- ADD THIS LINE
           SPREADSHEET_IDS: ${{ secrets.SPREADSHEET_IDS }}
           IMAGE_ADS_SOURCE_SPREADSHEET_ID: ${{ secrets.IMAGE_ADS_SOURCE_SPREADSHEET_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python load_ads_to_supabase.py
+        run: python -u load_ads_to_supabase.py
