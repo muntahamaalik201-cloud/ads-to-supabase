@@ -366,13 +366,10 @@ def get_existing_duplicate_keys_from_supabase(
     ad_type: str,
 ) -> set:
     if ad_type == "image":
-        select_cols = "image_url"
         key_columns = ["image_url"]
     elif ad_type == "video":
-        select_cols = "advertiser,_ad_type_raw"
         key_columns = ["advertiser", "_ad_type_raw"]
     else:
-        select_cols = "_row_hash"
         key_columns = ["_row_hash"]
 
     existing_keys = set()
@@ -381,13 +378,13 @@ def get_existing_duplicate_keys_from_supabase(
 
     while True:
         try:
+            # Select all columns ("*") to completely avoid PGRST125 path formatting errors on custom/underscored columns
             response = (
                 supabase_client.table(table_name)
-                .select(select_cols)
+                .select("*")
                 .range(start, start + page_size - 1)
                 .execute()
             )
-            # Handle different versions of the supabase-py response structure safely
             rows = getattr(response, "data", None)
             if rows is None and isinstance(response, dict):
                 rows = response.get("data", [])
