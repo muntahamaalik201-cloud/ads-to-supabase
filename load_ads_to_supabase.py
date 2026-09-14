@@ -1,13 +1,13 @@
 import os
 import re
 import hashlib
+import json
 from datetime import datetime, timezone
 
 import google.auth
 import pandas as pd
 from googleapiclient.discovery import build
 from supabase import create_client, Client
-
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -205,7 +205,7 @@ def find_matching_tab_name(sheets_service, spreadsheet_id: str, expected_tab_nam
             return sheet_name
 
     raise RuntimeError(
-        f"Could not find tab '{expected_tab_name}' in spreadsheet '{spreadsheet_id}'. "
+        f"Could not find tab '{expected_tab_name}' in spreadsheet (ID hidden). "
         f"Available tabs: {sheet_names}"
     )
 
@@ -234,7 +234,7 @@ def read_sheet_tab(
     width = max(len(row) for row in values)
     if width <= AD_TYPE_COLUMN_INDEX:
         raise RuntimeError(
-            f"Spreadsheet '{spreadsheet_id}', tab '{tab_name}' does not have column F. "
+            f"Spreadsheet (ID hidden), tab '{tab_name}' does not have column F. "
             "Column F is required to identify image/text/video ID/N/A."
         )
 
@@ -253,7 +253,7 @@ def read_sheet_tab(
         row_numbers.append(sheet_row_number)
 
     if not rows:
-        print(f"No data rows found in spreadsheet '{spreadsheet_id}', tab '{tab_name}'")
+        print(f"No data rows found in spreadsheet (ID hidden), tab '{tab_name}'")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=header)
@@ -270,7 +270,7 @@ def read_sheet_tab(
     df["_image_only_extra_read"] = bool(image_only_extra_read)
 
     print(
-        f"Read {len(df)} rows from spreadsheet '{spreadsheet_id}', tab '{tab_name}'. "
+        f"Read {len(df)} rows from tab '{tab_name}'. "
         f"Column F header detected as '{ad_type_column_name}'."
     )
     return df
@@ -479,13 +479,8 @@ def load_dataframe_to_supabase(
         print(f"No new rows to append into {table_name}")
         return
 
-    df_copy = df.copy()
-    if "_loaded_at_utc" in df_copy.columns:
-        df_copy["_loaded_at_utc"] = df_copy["_loaded_at_utc"].astype(str)
-
-    # Map pandas NaN/NaT to None for proper SQL NULL values
-    df_copy = df_copy.where(pd.notnull(df_copy), None)
-    records = df_copy.to_dict(orient="records")
+    # df.to_json safely formats Timestamps to ISO strings and converts Pandas NaN/NaT/NA to valid nulls.
+    records = json.loads(df.to_json(orient="records", date_format="iso"))
 
     chunk_size = 500
     total_inserted = 0
@@ -502,8 +497,11 @@ def load_dataframe_to_supabase(
 
 
 def main():
-    supabase_url = required_env("SUPABASE_URL")
-    supabase_key = required_env("SUPABASE_KEY")
+    raw_supabase_url = required_env("SUPABASE_URL").strip()
+    # Safely remove trailing slashes or /rest/v1 if accidentally included in the secret
+    supabase_url = raw_supabase_url.replace("/rest/v1", "").rstrip("/")
+    
+    supabase_key = required_env("SUPABASE_KEY").strip()
     supabase_client: Client = create_client(supabase_url, supabase_key)
     print("Supabase connection initialized.")
 
@@ -512,15 +510,8 @@ def main():
         required_env("IMAGE_ADS_SOURCE_SPREADSHEET_ID")
     )
 
-    print("Loaded spreadsheet IDs from SPREADSHEET_IDS:")
-    for sid in spreadsheet_ids:
-        print(f"- {sid[:6]}...{sid[-6:]} length={len(sid)}")
-
-    print(
-        "Image source spreadsheet ID:",
-        f"{image_ads_source_spreadsheet_id[:6]}...{image_ads_source_spreadsheet_id[-6:]}",
-        f"length={len(image_ads_source_spreadsheet_id)}",
-    )
+    print(f"Loaded {len(spreadsheet_ids)} spreadsheet IDs from environment.")
+    print("Image source spreadsheet ID loaded.")
 
     credentials, _ = google.auth.default(scopes=SCOPES)
     sheets_service = build(
@@ -533,10 +524,10 @@ def main():
     frames = []
 
     for spreadsheet_id in spreadsheet_ids:
-        print(f"Reading spreadsheet file: {spreadsheet_id}")
+        print("Reading a spreadsheet file...")
         sheet_names = get_all_sheet_names(sheets_service=sheets_service, spreadsheet_id=spreadsheet_id)
 
-        print(f"Found {len(sheet_names)} internal sheet/tab(s) in spreadsheet {spreadsheet_id}:")
+        print(f"Found {len(sheet_names)} internal sheet/tab(s).")
         for sheet_name in sheet_names:
             print(f"- {repr(sheet_name)}")
 
