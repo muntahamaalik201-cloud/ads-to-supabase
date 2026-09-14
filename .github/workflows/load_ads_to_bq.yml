@@ -1,11 +1,9 @@
-name: Ads Pipeline to BigQuery and Supabase
+name: Ads Pipeline to Supabase
 
 on:
   workflow_dispatch:
-    
   schedule:
     - cron: '0 4,8,12,16 * * *'
-  
 
 jobs:
   run:
@@ -23,7 +21,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Auth to GCP
+      - name: Auth to Google (Sheets API)
         uses: google-github-actions/auth@v3
         with:
           credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
@@ -33,10 +31,8 @@ jobs:
 
       - name: Run pipeline
         env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          BQ_DATASET: ${{ secrets.BQ_DATASET }}
           SPREADSHEET_IDS: ${{ secrets.SPREADSHEET_IDS }}
           IMAGE_ADS_SOURCE_SPREADSHEET_ID: ${{ secrets.IMAGE_ADS_SOURCE_SPREADSHEET_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python load_ads_to_bq.py
+        run: python load_ads_to_supabase.py
