@@ -387,7 +387,11 @@ def get_existing_duplicate_keys_from_supabase(
                 .range(start, start + page_size - 1)
                 .execute()
             )
-            rows = response.data or []
+            # Handle different versions of the supabase-py response structure safely
+            rows = getattr(response, "data", None)
+            if rows is None and isinstance(response, dict):
+                rows = response.get("data", [])
+            
             if not rows:
                 break
 
