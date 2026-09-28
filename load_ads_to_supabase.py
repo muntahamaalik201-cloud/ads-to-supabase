@@ -25,6 +25,9 @@ TABLE_BY_AD_TYPE = {
     "text": "text_ads",
 }
 
+# All tables use the 64-character SHA-256 _row_hash as the unique upsert conflict key
+CONFLICT_COLUMN = "_row_hash"
+
 SELECTED_COLUMNS_BY_AD_TYPE = {
     "image": [
         "advertiser",
@@ -51,15 +54,17 @@ SELECTED_COLUMNS_BY_AD_TYPE = {
     ],
 }
 
+# For image: hash the image_url
 IMAGE_HASH_COLUMNS = [
     "image_url",
 ]
 
+# For video: hash the youtube_url
 VIDEO_HASH_COLUMNS = [
-    "advertiser",
-    "_ad_type_raw",
+    "youtube_url",
 ]
 
+# For text: hash the composite source metadata
 TEXT_HASH_COLUMNS = [
     "_source_spreadsheet_id",
     "_source_tab",
@@ -178,10 +183,6 @@ def normalize_ad_type(value: str) -> str:
     if is_valid_video_id(raw_value):
         return "video"
     return "skip"
-
-
-def clean_key_value(value) -> str:
-    return str(value or "").strip().lower()
 
 
 def get_all_sheet_names(sheets_service, spreadsheet_id: str):
@@ -312,6 +313,12 @@ def select_columns_for_storage(df: pd.DataFrame, ad_type: str) -> pd.DataFrame:
             f"Available columns: {list(df.columns)}"
         )
 
+    if ad_type == "video" and "youtube_url" not in df.columns:
+        raise RuntimeError(
+            "Required column 'youtube_url' was not found for video ads. "
+            f"Available columns: {list(df.columns)}"
+        )
+
     metadata_without_hash = [col for col in METADATA_COLUMNS if col != "_row_hash"]
     base_columns = selected_columns + metadata_without_hash
     base_columns = list(dict.fromkeys(base_columns))
@@ -341,16 +348,22 @@ def select_columns_for_storage(df: pd.DataFrame, ad_type: str) -> pd.DataFrame:
         utc=True,
     )
 
+    # Filter out blank URLs
     if ad_type == "image":
-        before_blank_url_filter = len(result)
-        result["image_url"] = result["image_url"].astype("string").fillna("")
-        result = result[result["image_url"].astype(str).str.strip() != ""].copy()
-        after_blank_url_filter = len(result)
-        print(
-            f"Removed {before_blank_url_filter - after_blank_url_filter} image rows "
-            "because image_url is blank."
-        )
+        before_blank = len(result)
+        result["image_url"] = result["image_url"].astype("string").fillna("").str.strip()
+        result = result[result["image_url"] != ""].copy()
+        after_blank = len(result)
+        print(f"Removed {before_blank - after_blank} image rows because image_url is blank.")
 
+    if ad_type == "video":
+        before_blank = len(result)
+        result["youtube_url"] = result["youtube_url"].astype("string").fillna("").str.strip()
+        result = result[result["youtube_url"] != ""].copy()
+        after_blank = len(result)
+        print(f"Removed {before_blank - after_blank} video rows because youtube_url is blank.")
+
+    # Generate 64-char SHA-256 hash for conflict/dedupe
     hash_columns = get_hash_columns(ad_type)
     result["_row_hash"] = result.apply(lambda row: make_row_hash(row, hash_columns), axis=1)
     result["_row_hash"] = result["_row_hash"].astype("string").fillna("")
@@ -358,72 +371,6 @@ def select_columns_for_storage(df: pd.DataFrame, ad_type: str) -> pd.DataFrame:
     final_columns = selected_columns + METADATA_COLUMNS
     final_columns = list(dict.fromkeys(final_columns))
     return result[final_columns].copy()
-
-
-def get_existing_duplicate_keys_from_supabase(
-    supabase_client: Client,
-    table_name: str,
-    ad_type: str,
-) -> set:
-    if ad_type == "image":
-        key_columns = ["image_url"]
-    elif ad_type == "video":
-        key_columns = ["advertiser", "_ad_type_raw"]
-    else:
-        key_columns = ["_row_hash"]
-
-    existing_keys = set()
-    page_size = 1000
-    start = 0
-
-    while True:
-        try:
-            # Select all columns ("*") to completely avoid PGRST125 path formatting errors on custom/underscored columns
-            response = (
-                supabase_client.table(table_name)
-                .select("*")
-                .range(start, start + page_size - 1)
-                .execute()
-            )
-            rows = getattr(response, "data", None)
-            if rows is None and isinstance(response, dict):
-                rows = response.get("data", [])
-            
-            if not rows:
-                break
-
-            for row in rows:
-                values = [clean_key_value(row.get(col, "")) for col in key_columns]
-                if any(values):
-                    existing_keys.add(tuple(values))
-
-            if len(rows) < page_size:
-                break
-            start += page_size
-        except Exception as e:
-            print(f"Error reading existing keys from Supabase table {table_name}: {e}")
-            break
-
-    print(f"Found {len(existing_keys)} existing duplicate keys in Supabase {table_name}")
-    return existing_keys
-
-
-def make_current_duplicate_key(row, ad_type: str):
-    if ad_type == "image":
-        return (clean_key_value(row.get("image_url", "")),)
-    if ad_type == "video":
-        return (
-            clean_key_value(row.get("advertiser", "")),
-            clean_key_value(row.get("_ad_type_raw", "")),
-        )
-    return (clean_key_value(row.get("_row_hash", "")),)
-
-
-def is_blank_duplicate_key(key) -> bool:
-    try:
-        return not any(str(value or "").strip() for value in key)
-    except Exception:
-        return True
 
 
 def load_dataframe_to_supabase(
@@ -436,71 +383,38 @@ def load_dataframe_to_supabase(
         print(f"No rows to load for {table_name}")
         return
 
-    # Build normalized duplicate key for current batch
-    df["_dedupe_key"] = df.apply(lambda row: make_current_duplicate_key(row, ad_type), axis=1)
-
-    before_blank_key_filter = len(df)
-    df = df[~df["_dedupe_key"].apply(is_blank_duplicate_key)].copy()
-    after_blank_key_filter = len(df)
-    print(
-        f"Removed {before_blank_key_filter - after_blank_key_filter} rows "
-        f"with blank duplicate key for {table_name}."
-    )
-
+    # Deduplicate within current batch using _row_hash
     before_batch_dedupe = len(df)
-    df = df.drop_duplicates(subset=["_dedupe_key"]).copy()
+    df = df.drop_duplicates(subset=[CONFLICT_COLUMN], keep="last").copy()
     after_batch_dedupe = len(df)
-    print(
-        f"Removed {before_batch_dedupe - after_batch_dedupe} duplicate rows "
-        f"inside current batch for {table_name}."
-    )
+    if before_batch_dedupe != after_batch_dedupe:
+        print(f"Removed {before_batch_dedupe - after_batch_dedupe} duplicate rows inside current batch.")
 
-    # Check against existing rows stored in Supabase
-    existing_keys = get_existing_duplicate_keys_from_supabase(
-        supabase_client=supabase_client,
-        table_name=table_name,
-        ad_type=ad_type,
-    )
-
-    if existing_keys:
-        before_existing_filter = len(df)
-        df = df[~df["_dedupe_key"].isin(existing_keys)].copy()
-        after_existing_filter = len(df)
-        print(
-            f"Skipped {before_existing_filter - after_existing_filter} rows "
-            f"already existing in {table_name}."
-        )
-    else:
-        print(f"No existing rows found in {table_name}. All current unique rows are new.")
-
-    df = df.drop(columns=["_dedupe_key"], errors="ignore")
-
-    if df.empty:
-        print(f"No new rows to append into {table_name}")
-        return
-
-    # df.to_json safely formats Timestamps to ISO strings and converts Pandas NaN/NaT/NA to valid nulls.
     records = json.loads(df.to_json(orient="records", date_format="iso"))
 
     chunk_size = 500
-    total_inserted = 0
+    total_upserted = 0
+
+    print(f"Upserting {len(records)} rows into {table_name} on conflict '{CONFLICT_COLUMN}'...")
 
     for i in range(0, len(records), chunk_size):
         chunk = records[i: i + chunk_size]
         try:
-            supabase_client.table(table_name).insert(chunk).execute()
-            total_inserted += len(chunk)
+            supabase_client.table(table_name).upsert(
+                chunk,
+                on_conflict=CONFLICT_COLUMN,
+                ignore_duplicates=False,  # Updates row if conflict occurs
+            ).execute()
+            total_upserted += len(chunk)
         except Exception as e:
-            print(f"Error inserting batch into Supabase {table_name}: {e}")
+            print(f"Error upserting batch into Supabase {table_name}: {e}")
 
-    print(f"Appended {total_inserted} new rows into Supabase {table_name}")
+    print(f"Successfully upserted {total_upserted} rows into Supabase {table_name}")
 
 
 def main():
     raw_supabase_url = required_env("SUPABASE_URL").strip()
-    # Safely remove trailing slashes or /rest/v1 if accidentally included in the secret
     supabase_url = raw_supabase_url.replace("/rest/v1", "").rstrip("/")
-    
     supabase_key = required_env("SUPABASE_KEY").strip()
     supabase_client: Client = create_client(supabase_url, supabase_key)
     print("Supabase connection initialized.")
@@ -570,9 +484,6 @@ def main():
 
     all_ads_df = pd.concat(frames, ignore_index=True, sort=False)
     print(f"Total rows read from all source tabs: {len(all_ads_df)}")
-
-    print("Detected ad type counts before skip filter:")
-    print(all_ads_df["_ad_type"].value_counts(dropna=False))
 
     skip_rows = all_ads_df[all_ads_df["_ad_type"] == "skip"]
     if not skip_rows.empty:
@@ -653,12 +564,6 @@ def main():
             f"{filtered_df['_source_spreadsheet_id'].nunique() if not filtered_df.empty else 0} spreadsheet file(s), "
             f"{filtered_df['_source_tab'].nunique() if not filtered_df.empty else 0} tab(s)"
         )
-
-        if ad_type == "image" and not filtered_df.empty:
-            print("Image rows by source tab:")
-            print(filtered_df["_source_tab"].value_counts(dropna=False))
-            print("Image URL count before selection:")
-            print(filtered_df["image_url"].astype(str).str.strip().ne("").sum() if "image_url" in filtered_df.columns else 0)
 
         filtered_df = select_columns_for_storage(df=filtered_df, ad_type=ad_type)
 
