@@ -59,9 +59,10 @@ IMAGE_HASH_COLUMNS = [
     "image_url",
 ]
 
-# For video: hash the youtube_url
+# For video: hash the unique 16-character Video ID from Column F
+# This allows upsert to update the row later when youtube_url is generated
 VIDEO_HASH_COLUMNS = [
-    "youtube_url",
+    "_ad_type_raw",
 ]
 
 # For text: hash the composite source metadata
@@ -313,12 +314,6 @@ def select_columns_for_storage(df: pd.DataFrame, ad_type: str) -> pd.DataFrame:
             f"Available columns: {list(df.columns)}"
         )
 
-    if ad_type == "video" and "youtube_url" not in df.columns:
-        raise RuntimeError(
-            "Required column 'youtube_url' was not found for video ads. "
-            f"Available columns: {list(df.columns)}"
-        )
-
     metadata_without_hash = [col for col in METADATA_COLUMNS if col != "_row_hash"]
     base_columns = selected_columns + metadata_without_hash
     base_columns = list(dict.fromkeys(base_columns))
@@ -348,7 +343,7 @@ def select_columns_for_storage(df: pd.DataFrame, ad_type: str) -> pd.DataFrame:
         utc=True,
     )
 
-    # Filter out blank URLs
+    # For image ads, filter out blank URLs
     if ad_type == "image":
         before_blank = len(result)
         result["image_url"] = result["image_url"].astype("string").fillna("").str.strip()
@@ -356,12 +351,9 @@ def select_columns_for_storage(df: pd.DataFrame, ad_type: str) -> pd.DataFrame:
         after_blank = len(result)
         print(f"Removed {before_blank - after_blank} image rows because image_url is blank.")
 
-    if ad_type == "video":
-        before_blank = len(result)
+    # For video ads, clean youtube_url but DO NOT drop rows if empty
+    if ad_type == "video" and "youtube_url" in result.columns:
         result["youtube_url"] = result["youtube_url"].astype("string").fillna("").str.strip()
-        result = result[result["youtube_url"] != ""].copy()
-        after_blank = len(result)
-        print(f"Removed {before_blank - after_blank} video rows because youtube_url is blank.")
 
     # Generate 64-char SHA-256 hash for conflict/dedupe
     hash_columns = get_hash_columns(ad_type)
@@ -403,7 +395,7 @@ def load_dataframe_to_supabase(
             supabase_client.table(table_name).upsert(
                 chunk,
                 on_conflict=CONFLICT_COLUMN,
-                ignore_duplicates=False,  # Updates row if conflict occurs
+                ignore_duplicates=False,  # Updates row if exists (filling in youtube_url when available!)
             ).execute()
             total_upserted += len(chunk)
         except Exception as e:
